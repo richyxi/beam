@@ -78,9 +78,13 @@ from apache_beam.io import iobase
 from apache_beam.io.range_trackers import LexicographicKeyRangeTracker
 from apache_beam.io.range_trackers import OffsetRangeTracker
 from apache_beam.io.range_trackers import OrderedPositionRangeTracker
+from apache_beam.options.value_provider import StaticValueProvider
+from apache_beam.options.value_provider import ValueProvider
+from apache_beam.options.value_provider import check_accessible
 from apache_beam.transforms import DoFn
 from apache_beam.transforms import PTransform
 from apache_beam.transforms import Reshuffle
+from apache_beam.utils.annotations import experimental
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -111,6 +115,7 @@ except ImportError:
 __all__ = ["ReadFromMongoDB", "WriteToMongoDB"]
 
 
+@experimental()
 class ReadFromMongoDB(PTransform):
   """A ``PTransform`` to read MongoDB documents into a ``PCollection``."""
   def __init__(
@@ -148,11 +153,33 @@ class ReadFromMongoDB(PTransform):
     """
     if extra_client_params is None:
       extra_client_params = {}
-    if not isinstance(db, str):
-      raise ValueError("ReadFromMongDB db param must be specified as a string")
-    if not isinstance(coll, str):
-      raise ValueError(
-          "ReadFromMongDB coll param must be specified as a string")
+  
+    if not isinstance(uri, (str, ValueProvider)):
+      raise TypeError(
+          '%s: uri must be of type string'
+          ' or ValueProvider; got %r instead' %
+          (self.__class__.__name__, uri))
+    
+    if not isinstance(db, (str, ValueProvider)):
+      raise TypeError(
+          '%s: db must be of type string'
+          ' or ValueProvider; got %r instead' %
+          (self.__class__.__name__, db))
+
+    if not isinstance(coll, (str, ValueProvider)):
+      raise TypeError(
+          '%s: coll must be of type string'
+          ' or ValueProvider; got %r instead' %
+          (self.__class__.__name__, coll))
+
+    if filter and not isinstance(filter, (dict, ValueProvider)):
+      raise TypeError(
+          '%s: filter must be of type string'
+          ' or ValueProvider; got %r instead' %
+          (self.__class__.__name__, filter))
+  
+
+
     self._mongo_source = _BoundedMongoSource(
         uri=uri,
         db=db,
@@ -256,6 +283,16 @@ class _BoundedMongoSource(iobase.BoundedSource):
       extra_client_params = {}
     if filter is None:
       filter = {}
+
+    if isinstance(uri, str):
+      uri = StaticValueProvider(str, uri)
+    if isinstance(db, str):
+      db = StaticValueProvider(str, db)
+    if isinstance(coll, str):
+      coll = StaticValueProvider(str, coll)
+    if isinstance(filter, dict):
+      filter = StaticValueProvider(dict, filter)
+
     self.uri = uri
     self.db = db
     self.coll = coll
@@ -265,12 +302,12 @@ class _BoundedMongoSource(iobase.BoundedSource):
     self.bucket_auto = bucket_auto
 
   def estimate_size(self):
-    with MongoClient(self.uri, **self.spec) as client:
-      return client[self.db].command("collstats", self.coll).get("size")
+    with MongoClient(self.uri.get(), **self.spec) as client:
+      return client[self.db.get()].command("collstats", self.coll.get()).get("size")
 
   def _estimate_average_document_size(self):
-    with MongoClient(self.uri, **self.spec) as client:
-      return client[self.db].command("collstats", self.coll).get("avgObjSize")
+    with MongoClient(self.uri.get(), **self.spec) as client:
+      return client[self.db.get()].command("collstats", self.coll.get()).get("avgObjSize")
 
   def split(
       self,
@@ -405,11 +442,11 @@ class _BoundedMongoSource(iobase.BoundedSource):
     Returns:
       an iterator of data read by the source.
     """
-    with MongoClient(self.uri, **self.spec) as client:
+    with MongoClient(self.uri.get(), **self.spec) as client:
       all_filters = self._merge_id_filter(
           range_tracker.start_position(), range_tracker.stop_position())
       docs_cursor = (
-          client[self.db][self.coll].find(
+          client[self.db.get()][self.coll.get()].find(
               filter=all_filters,
               projection=self.projection).sort([("_id", ASCENDING)]))
       for doc in docs_cursor:
@@ -420,9 +457,9 @@ class _BoundedMongoSource(iobase.BoundedSource):
   def display_data(self):
     """Returns the display data associated to a pipeline component."""
     res = super().display_data()
-    res["database"] = self.db
-    res["collection"] = self.coll
-    res["filter"] = json.dumps(self.filter, default=json_util.default)
+    res["database"] = str(self.db)
+    res["collection"] = str(self.coll)
+    res["filter"] = json.dumps(self.filter.get(), default=json_util.default)
     res["projection"] = str(self.projection)
     res["bucket_auto"] = self.bucket_auto
     return res
@@ -455,9 +492,9 @@ class _BoundedMongoSource(iobase.BoundedSource):
     if self._range_is_not_splittable(start_pos, end_pos):
       return []
 
-    with MongoClient(self.uri, **self.spec) as client:
-      name_space = "%s.%s" % (self.db, self.coll)
-      return client[self.db].command(
+    with MongoClient(self.uri.get(), **self.spec) as client:
+      name_space = "%s.%s" % (self.db.get(), self.coll.get())
+      return client[self.db.get()].command(
         "splitVector",
         name_space,
         keyPattern={"_id": 1},  # Ascending index
@@ -494,7 +531,7 @@ class _BoundedMongoSource(iobase.BoundedSource):
       return []
 
     bucket_count = math.ceil(size_in_mb / desired_chunk_size_in_mb)
-    with beam.io.mongodbio.MongoClient(self.uri, **self.spec) as client:
+    with beam.io.mongodbio.MongoClient(self.uri.get(), **self.spec) as client:
       pipeline = [
           {
               # filter by positions and by the custom filter if any
@@ -508,7 +545,7 @@ class _BoundedMongoSource(iobase.BoundedSource):
       ]
       buckets = list(
           # Use `allowDiskUse` option to avoid aggregation limit of 100 Mb RAM
-          client[self.db][self.coll].aggregate(pipeline, allowDiskUse=True))
+          client[self.db.get()][self.coll.get()].aggregate(pipeline, allowDiskUse=True))
       if buckets:
         buckets[-1]["_id"]["max"] = end_pos
 
@@ -537,7 +574,7 @@ class _BoundedMongoSource(iobase.BoundedSource):
       all_filters = {
           # see more at
           # https://docs.mongodb.com/manual/reference/operator/query/and/
-          "$and": [self.filter.copy(), id_filter]
+          "$and": [self.filter.get().copy(), id_filter]
       }
     else:
       all_filters = id_filter
@@ -545,9 +582,9 @@ class _BoundedMongoSource(iobase.BoundedSource):
     return all_filters
 
   def _get_head_document_id(self, sort_order):
-    with MongoClient(self.uri, **self.spec) as client:
+    with MongoClient(self.uri.get(), **self.spec) as client:
       cursor = (
-          client[self.db][self.coll].find(filter={}, projection=[]).sort([
+          client[self.db.get()][self.coll.get()].find(filter={}, projection=[]).sort([
               ("_id", sort_order)
           ]).limit(1))
       try:
@@ -577,8 +614,8 @@ class _BoundedMongoSource(iobase.BoundedSource):
     """Number of documents between start_position (inclusive)
     and stop_position (exclusive), respecting the custom filter if any.
     """
-    with MongoClient(self.uri, **self.spec) as client:
-      return client[self.db][self.coll].count_documents(
+    with MongoClient(self.uri.get(), **self.spec) as client:
+      return client[self.db.get()][self.coll.get()].count_documents(
           filter=self._merge_id_filter(start_position, stop_position))
 
 
@@ -647,6 +684,7 @@ class _ObjectIdHelper:
     return _ObjectIdHelper.int_to_id(new_number)
 
 
+@experimental()
 class WriteToMongoDB(PTransform):
   """WriteToMongoDB is a ``PTransform`` that writes a ``PCollection`` of
   mongodb document to the configured MongoDB server.
@@ -696,11 +734,26 @@ class WriteToMongoDB(PTransform):
     """
     if extra_client_params is None:
       extra_client_params = {}
-    if not isinstance(db, str):
-      raise ValueError("WriteToMongoDB db param must be specified as a string")
-    if not isinstance(coll, str):
-      raise ValueError(
-          "WriteToMongoDB coll param must be specified as a string")
+
+
+    if not isinstance(uri, (str, ValueProvider)):
+      raise TypeError(
+          '%s: uri must be of type string'
+          ' or ValueProvider; got %r instead' %
+          (self.__class__.__name__, uri))
+    
+    if not isinstance(db, (str, ValueProvider)):
+      raise TypeError(
+          '%s: db must be of type string'
+          ' or ValueProvider; got %r instead' %
+          (self.__class__.__name__, db))
+
+    if not isinstance(coll, (str, ValueProvider)):
+      raise TypeError(
+          '%s: coll must be of type string'
+          ' or ValueProvider; got %r instead' %
+          (self.__class__.__name__, coll))
+  
     self._uri = uri
     self._db = db
     self._coll = coll
@@ -738,6 +791,14 @@ class _WriteMongoFn(DoFn):
       self, uri=None, db=None, coll=None, batch_size=100, extra_params=None):
     if extra_params is None:
       extra_params = {}
+
+    if isinstance(uri, str):
+      uri = StaticValueProvider(str, uri)
+    if isinstance(db, str):
+      db = StaticValueProvider(str, db)
+    if isinstance(coll, str):
+      coll = StaticValueProvider(str, coll)
+
     self.uri = uri
     self.db = db
     self.coll = coll
@@ -756,14 +817,14 @@ class _WriteMongoFn(DoFn):
   def _flush(self):
     if len(self.batch) == 0:
       return
-    with _MongoSink(self.uri, self.db, self.coll, self.spec) as sink:
+    with _MongoSink(self.uri.get(), self.db.get(), self.coll.get(), self.spec) as sink:
       sink.write(self.batch)
       self.batch = []
 
   def display_data(self):
     res = super().display_data()
-    res["database"] = self.db
-    res["collection"] = self.coll
+    res["database"] = str(self.db)
+    res["collection"] = str(self.coll)
     res["batch_size"] = self.batch_size
     return res
 
@@ -780,7 +841,7 @@ class _MongoSink:
 
   def write(self, documents):
     if self.client is None:
-      self.client = MongoClient(host=self.uri, **self.spec)
+      self.client = MongoClient(host=self.uri.get(), **self.spec)
     requests = []
     for doc in documents:
       # match document based on _id field, if not found in current collection,
